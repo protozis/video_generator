@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Real-Time Thermal+GPS Video Generator</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        #progress-container { margin-top: 20px; display: none; /* Initially hidden */ }
+        #progress-bar { width: 100%; height: 20px; }
+        #status-message { margin-top: 5px; font-style: italic; color: #555; }
+        #download-link-container { margin-top: 20px; display: none; /* Initially hidden */ }
+        #error-message { margin-top: 20px; display: none; /* Initially hidden */ color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 10px; border-radius: 5px; }
+        .message { margin-top: 20px; padding: 10px; border-radius: 5px; }
+        .success { background-color: #d4edda; border-color: #c3e6cb; color: #155724; }
+        .server-busy {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .server-busy.show {
+            display: block;
+        }
+        /* Add other styles from previous version if needed */
+    </style>
+</head>
+<body>
+    <h1>Upload Thermal Data File</h1>
+    <p>Upload a text file containing timestamped thermal frames (32x24) and GPS locations.</p>
+    <p>This tool will generate an MP4 video showing the thermal frame ('inferno' colormap) on top and a 2D GPS location plot at the bottom. The playback speed attempts to match the real-world timing based on timestamps.</p>
+
+    <div id="serverBusy" class="server-busy {% if server_busy %}show{% endif %}">
+        Server is currently busy generating a video. Please wait before uploading a new file.
+    </div>
+
+    <form id="upload-form" method="post" action="/upload" enctype="multipart/form-data">
+        <input type="file" name="file" id="file-input" accept=".txt" required>
+        <button type="submit" id="submit-button">Generate Real-Time Video</button>
+    </form>
+
+    <div id="progress-container">
+        <progress id="progress-bar" value="0" max="100"></progress>
+        <div id="status-message">Starting...</div>
+    </div>
+
+    <div id="error-message"></div>
+
+    <div id="download-link-container">
+         Video generated successfully! <a href="#" id="download-link" download>Download Video (MP4)</a>
+    </div>
+
+    <script>
+        const form = document.getElementById('upload-form');
+        const fileInput = document.getElementById('file-input');
+        const submitButton = document.getElementById('submit-button');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const statusMessage = document.getElementById('status-message');
+        const downloadContainer = document.getElementById('download-link-container');
+        const downloadLink = document.getElementById('download-link');
+        const errorContainer = document.getElementById('error-message');
+
+        let eventSource = null; // To keep track of the EventSource connection
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault(); // Prevent default synchronous form submission
+
+            // Reset UI
+            progressContainer.style.display = 'block';
+            progressBar.value = 0;
+            statusMessage.textContent = 'Uploading file...';
+            downloadContainer.style.display = 'none';
+            errorContainer.style.display = 'none';
+            errorContainer.textContent = '';
+            submitButton.disabled = true;
+            fileInput.disabled = true;
+
+            // Validate file input
+            if (!fileInput.files || fileInput.files.length === 0) {
+                errorContainer.textContent = 'Please select a file to upload.';
+                errorContainer.style.display = 'block';
+                submitButton.disabled = false;
+                fileInput.disabled = false;
+                return;
+            }
+
+            // Log file details
+            console.log('Selected file:', fileInput.files[0]);
+            console.log('File name:', fileInput.files[0].name);
+            console.log('File size:', fileInput.files[0].size);
+            console.log('File type:', fileInput.files[0].type);
+
+            // Check if server is busy
+            if (document.getElementById('serverBusy').classList.contains('show')) {
+                alert('Server is busy. Please wait before uploading a new file.');
+                submitButton.disabled = false;
+                fileInput.disabled = false;
+                return;
+            }
+
+            // Close previous EventSource if it exists
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+
+            const formData = new FormData();
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                errorContainer.textContent = 'Please select a file to upload.';
+                errorContainer.style.display = 'block';
+                submitButton.disabled = false;
+                fileInput.disabled = false;
+                return;
+            }
+            
+            // Explicitly append the file to FormData
+            formData.append('file', file);
+            
+            // Log form data contents for debugging
+            console.log('Form data contents:');
+            for (let pair of formData.entries()) {
+                console.log(pair[0] + ': ' + (pair[1] instanceof File ? 
+                    `File: ${pair[1].name} (${pair[1].size} bytes)` : 
+                    pair[1]));
+            }
+
+            try {
+                // 1. Send file to /upload endpoint
+                console.log('Sending request to /upload...');
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData,
+                    // Ensure proper headers are set
+                    headers: {
+                        'Accept': 'application/json',
+                    },
+                });
+                console.log('Response received:', response.status, response.statusText);
+
+                if (!response.ok) {
+                     // Try to get error message from server response body
+                     let errorMsg = `Upload failed with status: ${response.status}`;
+                     try {
+                         const errorData = await response.json();
+                         errorMsg = errorData.error || errorMsg;
+                     } catch (e) { /* Ignore if response body is not JSON */ }
+                     throw new Error(errorMsg);
+                }
+
+                // Check if response status is 202 Accepted
+                 if (response.status !== 202) {
+                     throw new Error(`Unexpected response status: ${response.status}`);
+                 }
+
+
+                const data = await response.json();
+                const taskId = data.task_id;
+
+                if (!taskId) {
+                    throw new Error('No task ID received from server.');
+                }
+
+                statusMessage.textContent = 'Processing video...';
+
+                // 2. Connect to the SSE stream for progress updates
+                eventSource = new EventSource(`/stream/${taskId}`);
+
+                eventSource.onmessage = (event) => {
+                    try {
+                        const progressData = JSON.parse(event.data);
+                        console.log("SSE data received:", progressData); // For debugging
+
+                        // Update progress bar and status message
+                        progressBar.value = progressData.percent || 0;
+                        statusMessage.textContent = progressData.message || `Processing... (${progressData.percent}%)`;
+
+                        // Check for completion or error
+                        if (progressData.status === 'complete') {
+                            statusMessage.textContent = 'Video generation complete!';
+                            if (progressData.result) {
+                                // Construct the correct download URL using url_for simulation
+                                // The 'result' contains the relative path like 'output_files/video.mp4'
+                                downloadLink.href = `/static/${progressData.result}`; // Use relative path directly
+                                downloadContainer.style.display = 'block';
+                            } else {
+                                 errorContainer.textContent = 'Completed but no download link provided.';
+                                 errorContainer.style.display = 'block';
+                            }
+                            progressContainer.style.display = 'none'; // Hide progress bar on completion
+                            eventSource.close(); // Close the connection
+                            submitButton.disabled = false;
+                            fileInput.disabled = false;
+
+                        } else if (progressData.status === 'error') {
+                            errorContainer.textContent = `Error: ${progressData.message || 'Unknown error occurred.'}`;
+                            errorContainer.style.display = 'block';
+                            progressContainer.style.display = 'none'; // Hide progress bar on error
+                            eventSource.close(); // Close the connection
+                            submitButton.disabled = false;
+                            fileInput.disabled = false;
+                        }
+                    } catch (e) {
+                        console.error("Error parsing SSE data:", e);
+                        // Optionally display a generic error to the user
+                        // errorContainer.textContent = 'Error processing progress update.';
+                        // errorContainer.style.display = 'block';
+                    }
+                };
+
+                eventSource.onerror = (error) => {
+                    console.error("EventSource failed:", error);
+                    errorContainer.textContent = 'Connection error during processing. Please try again.';
+                    errorContainer.style.display = 'block';
+                    progressContainer.style.display = 'none';
+                    if (eventSource) eventSource.close();
+                    submitButton.disabled = false;
+                    fileInput.disabled = false;
+                };
+
+            } catch (error) {
+                console.error('Upload or processing error:', error);
+                errorContainer.textContent = `An error occurred: ${error.message}`;
+                errorContainer.style.display = 'block';
+                progressContainer.style.display = 'none';
+                submitButton.disabled = false;
+                fileInput.disabled = false;
+                 if (eventSource) {
+                     eventSource.close(); // Ensure connection is closed on error
+                 }
+            }
+        });
+    </script>
+
+</body>
+</html>
