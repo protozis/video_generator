@@ -1,0 +1,10 @@
+
+Flask>=2.0        # Web framework
+numpy>=1.20       # Numerical operations (dependency for Matplotlib/OpenCV)
+matplotlib>=3.4   # For plotting thermal and GPS data
+opencv-python-headless>=4.5 # For video writing (cv2) and image processing - headless version preferred for servers
+
+# Notes:
+# - Pillow is often installed as a dependency by Matplotlib or OpenCV, but can be added explicitly if needed:
+# Pillow>=8.0
+# - Built-in modules like os, re, uuid, io, logging, tempfile, shutil, time, json, threading, datetime are not listed here.
